@@ -24,28 +24,38 @@ public class AdvancementListener implements Listener {
     public void onAdvancement(PlayerAdvancementDoneEvent event) {
         if (!plugin.isSyncEnabled()) return;
 
+        Player player = event.getPlayer();
         Advancement advancement = event.getAdvancement();
+        String advKey = advancement.getKey().toString();
 
-        // Skip recipe advancements to reduce spam
+        // Ignore recipe advancements
         if (advancement.getKey().getKey().startsWith("recipes/")) return;
 
-        Player player = event.getPlayer();
         Set<UUID> team = plugin.getTeam(player.getUniqueId());
-
         if (team == null) {
             // Global sync
             for (Player p : Bukkit.getOnlinePlayers()) {
-                grantAdvancement(p, advancement);
+                if (!plugin.getCompletedAdvancements()
+                        .getOrDefault(p.getUniqueId(), Set.of())
+                        .contains(advKey)) {
+                    grantAdvancement(p, advancement);
+                    plugin.markCompleted(p.getUniqueId(), advKey);
+                }
             }
         } else {
             // Team sync
             for (UUID uuid : team) {
                 Player teammate = Bukkit.getPlayer(uuid);
-                if (teammate != null) {
+                if (teammate != null && !plugin.getCompletedAdvancements()
+                        .getOrDefault(uuid, Set.of())
+                        .contains(advKey)) {
                     grantAdvancement(teammate, advancement);
+                    plugin.markCompleted(uuid, advKey);
                 }
             }
         }
+
+        plugin.saveData();
     }
 
     private void grantAdvancement(Player player, Advancement advancement) {
