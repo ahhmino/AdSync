@@ -2,17 +2,23 @@ package com.ahhmino.adsync;
 
 import com.ahhmino.adsync.commands.AdSyncCommand;
 import com.ahhmino.adsync.listeners.AdvancementListener;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
 import org.bukkit.Bukkit;
 import org.bukkit.advancement.Advancement;
 import org.bukkit.advancement.AdvancementProgress;
 import org.bukkit.entity.Player;
 import org.bukkit.plugin.java.JavaPlugin;
 
+import java.io.File;
+import java.io.FileReader;
 import java.util.*;
 
 public class AdSyncPlugin extends JavaPlugin {
     private boolean syncEnabled;
     private final Map<UUID, Map<String, Set<String>>> lastProgress = new HashMap<>();
+    private final Map<String, Set<String>> globalProgress = new HashMap<>();
 
     @Override
     public void onEnable() {
@@ -26,6 +32,7 @@ public class AdSyncPlugin extends JavaPlugin {
 
         getLogger().info("AdSync initialized. Sync is " + (syncEnabled ? "enabled" : "disabled"));
 
+        loadGlobalAdvancements();
         startProgressWatcher();
     }
 
@@ -44,6 +51,48 @@ public class AdSyncPlugin extends JavaPlugin {
         saveConfig();
     }
 
+    /** Loads all awarded advancement criteria from the world's advancement files */
+    private void loadGlobalAdvancements() {
+        globalProgress.clear();
+
+        File advDir = new File(getServer().getWorldContainer(), "world/advancements");
+        if (!advDir.exists()) {
+            getLogger().warning("No world/advancements directory found.");
+            return;
+        }
+
+        File[] files = advDir.listFiles((dir, name) -> name.endsWith(".json"));
+        if (files == null) return;
+
+        for (File file : files) {
+            try (FileReader reader = new FileReader(file)) {
+                JsonElement root = JsonParser.parseReader(reader);
+                if (!root.isJsonObject()) continue;
+
+                JsonObject json = root.getAsJsonObject();
+                for (Map.Entry<String, JsonElement> entry : json.entrySet()) {
+                    // Skip DataVersion or any non-object entries
+                    if (!entry.getValue().isJsonObject()) continue;
+
+                    String advKey = entry.getKey();
+                    JsonObject advObj = entry.getValue().getAsJsonObject();
+                    if (!advObj.has("criteria")) continue;
+
+                    JsonObject criteria = advObj.getAsJsonObject("criteria");
+                    for (String criterion : criteria.keySet()) {
+                        globalProgress.computeIfAbsent(advKey, k -> new HashSet<>()).add(criterion);
+                    }
+                }
+            } catch (Exception ex) {
+                getLogger().warning("Failed to parse advancement file " + file.getName() + ": " + ex.getMessage());
+            }
+        }
+
+        getLogger().info("Loaded global advancement progress for " + globalProgress.size() + " advancements.");
+    }
+
+
+
     /** Applies all known advancements to a joining player */
     public void applyGlobalAdvancements(Player player) {
         for (Iterator<Advancement> it = Bukkit.advancementIterator(); it.hasNext();) {
@@ -55,9 +104,17 @@ public class AdSyncPlugin extends JavaPlugin {
                     .anyMatch(AdvancementProgress::isDone);
 
             if (anyDone) {
-                Bukkit.getScheduler().runTask(this, () ->
-                        player.getAdvancementProgress(adv).awardCriteria(Arrays.toString(adv.getCriteria().toArray(new String[0])))
-                );
+                Set<String> globalCriteria = globalProgress.get(adv.getKey().toString());
+                if (globalCriteria != null) {
+                    Bukkit.getScheduler().runTask(this, () -> {
+                        AdvancementProgress p = player.getAdvancementProgress(adv);
+                        for (String c : globalCriteria) {
+                            if (!p.getAwardedCriteria().contains(c)) {
+                                p.awardCriteria(c);
+                            }
+                        }
+                    });
+                }
             }
         }
     }
@@ -99,7 +156,14 @@ public class AdSyncPlugin extends JavaPlugin {
 
     /** Syncs awarded criteria from one player to everyone else */
     private void syncCriteria(Advancement adv, Set<String> criteria, Player source) {
+        String advKey = adv.getKey().toString();
+
+        // ✅ 1. Update global progress immediately
+        globalProgress.computeIfAbsent(advKey, k -> new HashSet<>()).addAll(criteria);
+
+        // ✅ 2. Sync criteria to all online players
         for (Player other : Bukkit.getOnlinePlayers()) {
+            // Skip the source player (they already have these)
             if (other.equals(source)) continue;
 
             AdvancementProgress progress = other.getAdvancementProgress(adv);
@@ -122,15 +186,24 @@ public class AdSyncPlugin extends JavaPlugin {
             Advancement adv = it.next();
             if (adv.getKey().getKey().startsWith("recipes/")) continue;
 
-            // Collect all criteria any player has completed
-            Set<String> combinedCriteria = new HashSet<>();
+            String advKey = adv.getKey().toString();
+
+            // Start with the globally known criteria (loaded from disk)
+            Set<String> combinedCriteria = new HashSet<>(
+                    globalProgress.getOrDefault(advKey, Collections.emptySet())
+            );
+
+            // Add in any progress from currently online players
             for (Player p : Bukkit.getOnlinePlayers()) {
                 combinedCriteria.addAll(p.getAdvancementProgress(adv).getAwardedCriteria());
             }
 
             if (combinedCriteria.isEmpty()) continue;
 
-            // Apply combined progress to all players
+            // Update the globalProgress map with the merged set
+            globalProgress.put(advKey, combinedCriteria);
+
+            // Apply the merged progress to all online players
             for (Player p : Bukkit.getOnlinePlayers()) {
                 AdvancementProgress progress = p.getAdvancementProgress(adv);
                 for (String criterion : combinedCriteria) {
