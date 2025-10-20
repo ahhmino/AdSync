@@ -1,17 +1,12 @@
 name: AdSync
-main: com.ahhmino.adsync.AdSync
-version: 1.2.0
+main: com.ahhmino.adsync.AdSyncPlugin
+version: 2.0.0
 api-version: 1.16
-author: YourName
 commands:
   adsync:
-    description: Control advancement sync and teams
-    usage: /adsync <enable|status|team|reset-teams|help|reload>
+    description: Global advancement synchronization
+    usage: /adsync <enable|disable|reload|scan>
     permission: adsync.use
 permissions:
   adsync.use:
-    description: Allows use of AdSync commands
-    default: true
-  adsync.admin:
-    description: Allows enabling/disabling sync and reloading
     default: op
