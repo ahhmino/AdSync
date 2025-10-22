@@ -6,6 +6,7 @@ import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import org.bukkit.Bukkit;
+import org.bukkit.World;
 import org.bukkit.advancement.Advancement;
 import org.bukkit.advancement.AdvancementProgress;
 import org.bukkit.entity.Player;
@@ -18,7 +19,7 @@ import java.util.*;
 public class AdSyncPlugin extends JavaPlugin {
     private boolean syncEnabled;
     private final Map<UUID, Map<String, Set<String>>> lastProgress = new HashMap<>();
-    private final Map<String, Set<String>> globalProgress = new HashMap<>();
+    public Map<String, Set<String>> globalProgress = new HashMap<>();
 
     @Override
     public void onEnable() {
@@ -34,6 +35,10 @@ public class AdSyncPlugin extends JavaPlugin {
 
         loadGlobalAdvancements();
         startProgressWatcher();
+
+        if (syncEnabled) {
+            Bukkit.getScheduler().runTaskLater(this, this::resyncAllPlayers, 40L);
+        }
     }
 
     @Override
@@ -51,12 +56,11 @@ public class AdSyncPlugin extends JavaPlugin {
         saveConfig();
     }
 
-    /** Loads all awarded advancement criteria from the world's advancement files */
-    private void loadGlobalAdvancements() {
+    /** Load all awarded advancement criteria from disk (offline players included) */
+    public void loadGlobalAdvancements() {
         globalProgress.clear();
-
         File advDir = new File(getServer().getWorldContainer(), "world/advancements");
-        if (!advDir.exists()) {
+        if (!advDir.exists() || !advDir.isDirectory()) {
             getLogger().warning("No world/advancements directory found.");
             return;
         }
@@ -64,6 +68,7 @@ public class AdSyncPlugin extends JavaPlugin {
         File[] files = advDir.listFiles((dir, name) -> name.endsWith(".json"));
         if (files == null) return;
 
+        int count = 0;
         for (File file : files) {
             try (FileReader reader = new FileReader(file)) {
                 JsonElement root = JsonParser.parseReader(reader);
@@ -71,58 +76,61 @@ public class AdSyncPlugin extends JavaPlugin {
 
                 JsonObject json = root.getAsJsonObject();
                 for (Map.Entry<String, JsonElement> entry : json.entrySet()) {
-                    // Skip DataVersion or any non-object entries
                     if (!entry.getValue().isJsonObject()) continue;
 
                     String advKey = entry.getKey();
                     JsonObject advObj = entry.getValue().getAsJsonObject();
-                    if (!advObj.has("criteria")) continue;
+                    if (!advObj.has("criteria") || !advObj.get("criteria").isJsonObject()) continue;
 
                     JsonObject criteria = advObj.getAsJsonObject("criteria");
                     for (String criterion : criteria.keySet()) {
                         globalProgress.computeIfAbsent(advKey, k -> new HashSet<>()).add(criterion);
                     }
                 }
+                count++;
             } catch (Exception ex) {
                 getLogger().warning("Failed to parse advancement file " + file.getName() + ": " + ex.getMessage());
             }
         }
-
-        getLogger().info("Loaded global advancement progress for " + globalProgress.size() + " advancements.");
+        getLogger().info("Loaded global advancement progress from " + count + " files (" + globalProgress.size() + " advs).");
     }
 
-
-
-    /** Applies all known advancements to a joining player */
+    /** Apply union of globalProgress + online player progress to a joining player */
     public void applyGlobalAdvancements(Player player) {
         for (Iterator<Advancement> it = Bukkit.advancementIterator(); it.hasNext();) {
             Advancement adv = it.next();
             if (adv.getKey().getKey().startsWith("recipes/")) continue;
 
-            boolean anyDone = Bukkit.getOnlinePlayers().stream()
-                    .map(p -> p.getAdvancementProgress(adv))
-                    .anyMatch(AdvancementProgress::isDone);
+            String advKey = adv.getKey().toString();
 
-            if (anyDone) {
-                Set<String> globalCriteria = globalProgress.get(adv.getKey().toString());
-                if (globalCriteria != null) {
-                    Bukkit.getScheduler().runTask(this, () -> {
-                        AdvancementProgress p = player.getAdvancementProgress(adv);
-                        for (String c : globalCriteria) {
-                            if (!p.getAwardedCriteria().contains(c)) {
-                                p.awardCriteria(c);
-                            }
-                        }
-                    });
+            Set<String> union = new HashSet<>(globalProgress.getOrDefault(advKey, Collections.emptySet()));
+            for (Player p : Bukkit.getOnlinePlayers()) {
+                union.addAll(p.getAdvancementProgress(adv).getAwardedCriteria());
+            }
+
+            AdvancementProgress prog = player.getAdvancementProgress(adv);
+            boolean updated = false;
+            for (String c : union) {
+                if (!prog.getAwardedCriteria().contains(c)) {
+                    prog.awardCriteria(c);
+                    updated = true;
                 }
+            }
+
+            if (updated) {
+                // Save world once per advancement if any new criteria were applied
+                Bukkit.getWorlds().forEach(world -> world.save());
             }
         }
     }
 
-    /** Periodically checks and syncs incremental criteria progress */
+    /** Periodically checks incremental progress and propagates to all online players */
     private void startProgressWatcher() {
         Bukkit.getScheduler().runTaskTimer(this, () -> {
             if (!syncEnabled) return;
+
+            // Reload globalProgress from disk for offline players
+            loadGlobalAdvancements();
 
             for (Player player : Bukkit.getOnlinePlayers()) {
                 UUID id = player.getUniqueId();
@@ -135,11 +143,9 @@ public class AdSyncPlugin extends JavaPlugin {
                     AdvancementProgress progress = player.getAdvancementProgress(adv);
                     String key = adv.getKey().toString();
 
-                    // Get last recorded criteria for this player/advancement
                     Set<String> previous = lastProgress.get(id).computeIfAbsent(key, k -> new HashSet<>());
                     Set<String> current = new HashSet<>(progress.getAwardedCriteria());
 
-                    // Detect newly completed criteria
                     Set<String> newCriteria = new HashSet<>(current);
                     newCriteria.removeAll(previous);
 
@@ -147,76 +153,85 @@ public class AdSyncPlugin extends JavaPlugin {
                         syncCriteria(adv, newCriteria, player);
                     }
 
-                    // Update record
                     lastProgress.get(id).put(key, current);
                 }
             }
-        }, 100L, 100L); // every 5 seconds
+        }, 100L, 100L);
     }
 
-    /** Syncs awarded criteria from one player to everyone else */
-    private void syncCriteria(Advancement adv, Set<String> criteria, Player source) {
+    /** Update globalProgress in memory and award criteria to all online players */
+    public void syncCriteria(Advancement adv, Set<String> criteria, Player source) {
         String advKey = adv.getKey().toString();
 
-        // ✅ 1. Update global progress immediately
         globalProgress.computeIfAbsent(advKey, k -> new HashSet<>()).addAll(criteria);
 
-        // ✅ 2. Sync criteria to all online players
-        for (Player other : Bukkit.getOnlinePlayers()) {
-            // Skip the source player (they already have these)
-            if (other.equals(source)) continue;
+        Bukkit.getScheduler().runTask(this, () -> {
+            boolean updated = false;
 
-            AdvancementProgress progress = other.getAdvancementProgress(adv);
-            for (String criterion : criteria) {
-                if (!progress.getAwardedCriteria().contains(criterion)) {
-                    Bukkit.getScheduler().runTask(this, () ->
-                            progress.awardCriteria(criterion)
-                    );
+            for (Player other : Bukkit.getOnlinePlayers()) {
+                if (other.equals(source)) continue;
+
+                AdvancementProgress progress = other.getAdvancementProgress(adv);
+                for (String criterion : criteria) {
+                    if (!progress.getAwardedCriteria().contains(criterion)) {
+                        progress.awardCriteria(criterion);
+                        updated = true;
+                    }
                 }
             }
-        }
+
+            // Flush world once if any criteria were applied
+            if (updated) {
+                Bukkit.getWorlds().forEach(world -> world.save());
+            }
+        });
     }
 
+    /** Merge disk + online progress and apply to all online players */
     public void resyncAllPlayers() {
         if (!syncEnabled) return;
 
         getLogger().info("Performing full AdSync resynchronization...");
 
-        for (Iterator<Advancement> it = Bukkit.advancementIterator(); it.hasNext();) {
-            Advancement adv = it.next();
-            if (adv.getKey().getKey().startsWith("recipes/")) continue;
+        loadGlobalAdvancements();
 
-            String advKey = adv.getKey().toString();
+        // Merge online players' in-memory progress
+        for (Player p : Bukkit.getOnlinePlayers()) {
+            for (Iterator<Advancement> it = Bukkit.advancementIterator(); it.hasNext();) {
+                Advancement adv = it.next();
+                if (adv.getKey().getKey().startsWith("recipes/")) continue;
 
-            // Start with the globally known criteria (loaded from disk)
-            Set<String> combinedCriteria = new HashSet<>(
-                    globalProgress.getOrDefault(advKey, Collections.emptySet())
-            );
-
-            // Add in any progress from currently online players
-            for (Player p : Bukkit.getOnlinePlayers()) {
-                combinedCriteria.addAll(p.getAdvancementProgress(adv).getAwardedCriteria());
+                String advKey = adv.getKey().toString();
+                Set<String> union = globalProgress.computeIfAbsent(advKey, k -> new HashSet<>());
+                union.addAll(p.getAdvancementProgress(adv).getAwardedCriteria());
             }
+        }
 
-            if (combinedCriteria.isEmpty()) continue;
+        int appliedCount = 0;
+        for (Player p : Bukkit.getOnlinePlayers()) {
+            for (Iterator<Advancement> it = Bukkit.advancementIterator(); it.hasNext();) {
+                Advancement adv = it.next();
+                if (adv.getKey().getKey().startsWith("recipes/")) continue;
 
-            // Update the globalProgress map with the merged set
-            globalProgress.put(advKey, combinedCriteria);
-
-            // Apply the merged progress to all online players
-            for (Player p : Bukkit.getOnlinePlayers()) {
+                String advKey = adv.getKey().toString();
+                Set<String> union = globalProgress.getOrDefault(advKey, Collections.emptySet());
                 AdvancementProgress progress = p.getAdvancementProgress(adv);
-                for (String criterion : combinedCriteria) {
+
+                boolean updated = false;
+                for (String criterion : union) {
                     if (!progress.getAwardedCriteria().contains(criterion)) {
-                        Bukkit.getScheduler().runTask(this, () ->
-                                progress.awardCriteria(criterion)
-                        );
+                        progress.awardCriteria(criterion);
+                        updated = true;
+                        appliedCount++;
                     }
+                }
+
+                if (updated) {
+                    Bukkit.getWorlds().forEach(World::save);
                 }
             }
         }
 
-        getLogger().info("AdSync resynchronization complete.");
+        getLogger().info("AdSync resynchronization complete. Applied " + appliedCount + " criteria.");
     }
-
 }
